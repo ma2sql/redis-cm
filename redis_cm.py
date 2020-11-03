@@ -1,7 +1,5 @@
-from ..util import summarize_slots
-from ..const import CLUSTER_HASH_SLOTS
-from ..xprint import xprint
-
+import redis
+from xprint import xprint
 
 def summarize_slots(slots):
     _temp_slots = []
@@ -26,27 +24,114 @@ def parse_slots(slots):
 
     return parsed_slots
 
+class ParseHelperError(Exception): pass
+class ParseHelper:
+    @classmethod
+    def parse_addr(cls, addr):
+        s = addr.split('@')[0].split(':')[:2]
+        if len(s) < 2:
+            raise ParseHelperError(f"Invalid IP or Port (given as {addr}) - use IP:Port format")
+        host = ':'.join(s[:-1])
+        port = int(s[-1])
+        return host, port
 
+    @classmethod
+    def parse_slots(cls, slots):
+        parsed_slots = []
+        migrating = {}
+        importing = {}
+        for s in slots:
+            s_len = len(s)
+            if s_len == 1:
+                parsed_slots += [int(s[0])]
+            elif s_len == 2:
+                start, end = map(int, s)
+                parsed_slots += list(range(start, end+1))
+            elif s_len == 3:
+                slot, direction, node_id = s
+                slot = int(slot[1:])
+                node_id = node_id[:-1]
+                if direction == '>':
+                    migrating.update({slot: node_id})
+                else:
+                    importing.update({slot: node_id})
+
+        return sorted(parsed_slots), migrating, importing        
+
+    @classmethod
+    def parse_flags(cls, flags):
+        return flags.split(',')
+ 
+
+class NodeException(Exception): pass
 class Node:
-    def __init__(self, addr, node, friends):
-        self._addr = addr
-        self._node = node
-        self._friends = friends or []
+    def __init__(self, addr, password=None):
+        self._origin_addr = addr
+        self._password = password
+        self._friends = []
+        self._host, self._port = ParseHelper.parse_addr(addr)
+        self._r = None
+        self._info = {}
+
+    def connect(self):
+        if self._r:
+            return
+        xprint.verbose(f"Connecting to node {self}: ", end="")
+        try:
+            self._r = redis.StrictRedis(self._host, self._port,
+                                        password=self._password,
+                                        socket_timeout=3, decode_responses=True)
+            self._r.ping()
+        except redis.exceptions.RedisError as e:
+            xprint.verbose("FAIL", ignore_header=True)
+            self._r = None
+            raise NodeException(f"Sorry, can't connect to node '{self}'. Reason: {e}")
+        xprint.verbose("OK", ignore_header=True)
+
+    def _cluster_nodes(self):
+        return self._r.cluster('NODES')
+
+    def load_info(self, with_friends=False):
+        self._friends = []
+        nodes = self._cluster_nodes() 
+
+        for addr, info in nodes.items():
+            host, port = ParseHelper.parse_addr(addr)
+            flags = ParseHelper.parse_flags(info['flags'])
+            if 'myself' in flags:
+                slots, migrating, importing = ParseHelper.parse_slots(info['slots'])
+                replicate = info['master_id'] if info['master_id'] != '-' else None
+                self._info = {
+                    'node_id': info['node_id'],
+                    'host': host,
+                    'port': port,
+                    'flags': flags,
+                    'slots': slots,
+                    'migrating': migrating,
+                    'importing': importing,
+                    'replicate': replicate,
+                }
+            elif with_friends:
+                self._friends.append({f"{host}:{port}": flags})
+
+    @property
+    def friends(self):
+        return self._friends
 
     def __str__(self):
-        return self._addr
+        return f"{self._host}:{self._port}" 
 
     @property
     def node_id(self):
-        return self._node.get('node_id')
+        return self._info.get('node_id')
 
     @property
     def migrating(self):
-        return self._node.get('migrating') or {}
+        return self._info.get('migrating') or {}
 
     @property
     def importing(self):
-        return self._node.get('importing') or {}
+        return self._info.get('importing') or {}
 
     @property
     def friends(self):
@@ -54,11 +139,11 @@ class Node:
 
     @property
     def slots(self):
-        return parse_slots(self._node['slots']) 
+        return self._info.get('slots')
 
     @property
     def flags(self):
-        return self._node.get('flags').split(',')
+        return self._info.get('flags') 
    
     def config_signature(self):
         signature = []
@@ -105,6 +190,7 @@ class Node:
     def cluster_delslots(self, slots):
         pass
 
+
 class Nodes:
     def __init__(self, nodes):
         self._nodes = nodes
@@ -113,6 +199,17 @@ class Nodes:
     def covered_slots(self):
         return set(slot for n in self
                         for slot in n.slots)
+
+    @property
+    def open_slots(self):
+        total_open_slots = set()
+        for node in self:
+            for open_type in [MIGRATING, IMPORTING]:
+                slots = getattr(node, open_type) 
+                if slots:
+                    total_open_slots = total_open_slots.union(set(slots.keys()))
+        return sorted(total_open_slots)
+
 
     def __iter__(self):
         for node in self._nodes:
@@ -301,7 +398,7 @@ class FixOpenSlot:
 
 
     def elect_owner_from_candidates(self):
-        owner = self._get_node_with_most_keys_in_slot(self._nodes, slot)
+        owner = self.get_node_with_most_keys_in_slot(self._nodes, slot)
         owner.clear_slot(slot)
         owner.set_slot_owner(slot)
         owner.add_slots(slot)
@@ -408,8 +505,3 @@ class FixOpenSlotNoOwner(FixOpenSlot):
         importing.remove(owner)
 
 
-
-class FixOpenSlotMultipleOwner(FixOpenSlot):
-    def __init__(self):
-        super().__init__(self)
-    
