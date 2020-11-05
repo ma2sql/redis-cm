@@ -122,6 +122,14 @@ class Node:
         return f"{self._host}:{self._port}" 
 
     @property
+    def host(self):
+        return self._info.get('host')
+
+    @property
+    def port(self):
+        return self._info.get('port')
+
+    @property
     def node_id(self):
         return self._info.get('node_id')
 
@@ -144,6 +152,12 @@ class Node:
     @property
     def flags(self):
         return self._info.get('flags') 
+
+    def is_master(self):
+        return 'master' in self._info.get('flags')
+
+    def is_slave(self):
+        return 'slave' in self._info.get('flags')
    
     def config_signature(self):
         signature = []
@@ -179,21 +193,34 @@ class Node:
         pass
 
     def cluster_setslot_node(self, slot, owner):
-        pass
+        self._r.cluster('SETSLOT', slot, 'NODE', owner.node_id)
 
     def cluster_setslot_migrating(self, slot, target):
-        pass
+        self._r.cluster('SETSLOT', slot, 'MIGRATING', target.node_id)
  
     def cluster_setslot_importing(self, slot, source):
-        pass
+        self._r.cluster('SETSLOT', slot, 'IMPORTING', source.node_id)
 
     def cluster_delslots(self, slots):
         pass
 
+    def cluster_get_keys_in_slot(self, slot, count):
+        return self._r.cluster('GETKEYSINSLOT', slot, count)
+
+    def migrate(self, dst, keys_in_slot, password, timeout=60, replace=False): 
+        # migrate(self, host, port, keys, destination_db, timeout, copy=False, replace=False, auth=None)
+        self._r.migrate(dst.host, dst.port, keys_in_slot, 0, timeout,
+                        auth=password, replace=replace)
+   
+
 
 class Nodes:
-    def __init__(self, nodes):
+    def __init__(self, nodes, password=None):
         self._nodes = nodes
+        self._password = password
+
+    def __getitem__(self, key):
+        return self._nodes[key]
 
     @property
     def covered_slots(self):
@@ -220,8 +247,8 @@ class Nodes:
 
     @property
     def masters(self):
-        for node in self:
-            if 'master' in node.flags:
+        for node in self._nodes:
+            if node.is_master():
                 yield node
 
 
@@ -319,7 +346,6 @@ class MoveSlot:
 
 
 class FixCluster:
-
     def __init__(self, nodes):
         self._nodes = nodes
 
@@ -332,6 +358,9 @@ class FixOpenSlot:
         self._migrating = []
         self._importing = []
 
+    @property
+    def nodes(self):
+        return self._nodes
 
     def get_node_with_most_keys_in_slot(self, nodes, slot):
         best = None
@@ -346,6 +375,9 @@ class FixOpenSlot:
 
         return best
 
+    def assert_owner(self):
+        if self._owner is None:
+            raise BaseException()
 
     def fix_open_slot(self, slot):
         self.set_owner_candidates(slot)
@@ -406,6 +438,7 @@ class FixOpenSlot:
         self._importing = [n for n in self._importing if n != owner]
         self._migrating = [n for n in self._migrating if n != owner]
 
+
     def change_owner_to_donor(self):
         if self._owner is None:
             raise BaseException('No owner')
@@ -418,6 +451,7 @@ class FixOpenSlot:
             self._importing = [_n for _n in self._importing if _n != n] 
             self._importing.append(n)
             self._migrating = [_n for _n in self._migrating if _n != n]
+
 
     def moving_slots(self, slot, owner):
         self._migrating = []
@@ -443,65 +477,59 @@ class FixOpenSlot:
         return FixOpenSlotMultipleOwner
 
 
-class FixOpenSlot:
-    def __init__(self):
+    def fix_on_case_1(self):
+        src = self._migrating[0]
+        dst = self._importing[0]
+        move_slot(src, dst, slot, update=True)
+
+    def fix_on_case_2(self):
         pass
 
-    def get_node_with_most_keys_in_slot(self, nodes, slot):
-        best = None
-        best_numkeys = 0
+    def fix_on_case_3(self):
+        pass
 
-        for n in nodes:
-            numkeys = n.cluster_count_keys_in_slot(slot)
-            if numkeys > best_numkeys or best is None:
-                numkeys = n.cluster_count_keys_in_slot(slot)
-                best = n
-                best_numkeys = numkeys
-
-        return best
-        
+    def fix_on_case_4(self):
+        pass
 
 
-class FixOpenSlotNoOwner(FixOpenSlot):
-    def __init__(self, nodes, fix_cluster, slot):
-        super().__init__(self)
-        self._nodes = nodes
-        self._fix_cluster = fix_cluster
+class MoveSlot:
+    def __init__(self, slot, src, dst, password=None):
         self._slot = slot
+        self._src = src
+        self._dst = dst
+        self._password = password
+        self._pipeline = 10
+        self._timeout = 60
+        self._fix = False
+        self._dots = True
 
-    def _get_owner(self):
-        owner = self._get_node_with_most_keys_in_slot(
-                    self._nodes.get_masters(), self._slot)
+    def set_moving(self):
+        self._dst.cluster_setslot_importing(self._slot, self._src) 
+        self._src.cluster_setslot_migrating(self._slot, self._dst) 
+        return self
 
-    def fix(self):
-        owner = self._get_owner()
-        if not owner:
-            raise FixOpenSlotError("[ERR] Can't select a slot owner. Impossible to fix.")
+    def update_config(self):
+        self._src.del_slots(self._slot)
+        self._dst.add_slots(self._slot)
+        return self
 
-        xprint(f"*** Configuring {owner} as the slot owner")
+    def notify(self, nodes):
+        self._dst.cluster_setslot_node(self._slot, self._dst)
+        self._src.cluster_setslot_node(self._slot, self._dst)
+        for n in [n for n in nodes.masters
+                    if n not in (self._src, self._dst)]:
+            n.cluster_setslot_node(self._slot, self._dst)
+        return self
 
-        # clear
-        owner.cluster_setslot_stable(slot)
-
-        with r.pipeline(transaction=True) as t:
-            t.cluster('DELSLOTS', slot)
-            t.cluster('ADDSLOTS', slot)
-            t.cluster('SETSLOT', slot, 'STABLE')
-            t.cluster('BUMPEPOCH')
-            results = t.execute(raise_on_error=False)
-       
-        delslot_err, *remain_err = results
-        if isinstance(delslot_err, redis.ResponseError):
-            if not str(delslot_err).endswith('already unassigned'):
-                raise BaseException('ERROR!')
-        if any(isinstance(err, redis.ResponseError) for err in remain_err):
-            raise BaseException('ERROR!')
-
-        owner.add_slots(slot, new=False)
-        owner.cluster_bumpepoch()
-        # Remove the owner from the list of migrating/importing
-        # nodes.
-        migrating.remove(owner)
-        importing.remove(owner)
-
+    def move_slot(self):
+        # only for 3.0.7++
+        while keys_in_slot := self._src.cluster_get_keys_in_slot(self._slot, self._pipeline): 
+            print(keys_in_slot)
+            try:
+                self._src.migrate(self._dst, keys_in_slot, self._password)
+            except redis.exceptions.ResponseError as e:
+                if self._fix and str(e).find('BUSYKEY'):
+                    self._src.migrate(dst.host, dst.port, keys_in_slot,
+                        timeout, auth=self._password, replace=True)
+        return self
 
